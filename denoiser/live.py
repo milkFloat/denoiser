@@ -7,6 +7,7 @@
 
 import argparse
 import sys
+import queue
 
 import sounddevice as sd
 import torch
@@ -14,6 +15,8 @@ import torch
 from .demucs import DemucsStreamer
 from .pretrained import add_model_flags, get_model
 from .utils import bold
+import numpy as np
+from denoiser.live_plotting import *
 
 
 def get_parser():
@@ -79,7 +82,33 @@ def query_devices(device, kind):
     return caps
 
 
+# input_audio = queue.Queue()
+# output_audio = queue.Queue()
+# plotdata = np.zeros((20000, 1))
+# plotdata_enhance = np.zeros((20000, 1))
+#
+# fig, (ax1, ax2) = plt.subplots(nrows=2)
+# ax1.set_ylim([-0.5, 0.5])
+# ax2.set_ylim([-0.5, 0.5])
+# lines1 = ax1.plot(plotdata)
+# lines2 = ax2.plot(plotdata_enhance)
+#
+#
+# lines = [lines1, lines2]
+#
+#
+# async def plot_trace(data, data_enhance):
+#     for column, line in enumerate(lines[0]):
+#         line.set_ydata(data[:])
+#     for column, line in enumerate(lines[1]):
+#         line.set_ydata(data_enhance[:])
+#     plt.savefig('/Users/ashanahan/Documents/GitHub/denoiser/templates/03.png')
+#
+# loop = asyncio.get_event_loop()
+
+
 def main():
+    global plotdata, plotdata_enhance
     args = get_parser().parse_args()
     if args.num_threads:
         torch.set_num_threads(args.num_threads)
@@ -103,7 +132,7 @@ def main():
     stream_out = sd.OutputStream(
         device=device_out,
         samplerate=args.sample_rate,
-        channels=channels_out)
+        channels=2)#channels_out)
 
     stream_in.start()
     stream_out.start()
@@ -116,6 +145,7 @@ def main():
     sr_ms = args.sample_rate / 1000
     stride_ms = streamer.stride / sr_ms
     print(f"Ready to process audio, total lag: {streamer.total_length / sr_ms:.1f}ms.")
+    counter = 1
     while True:
         try:
             if current_time > last_log_time + log_delta:
@@ -125,11 +155,15 @@ def main():
                 print(f"time per frame: {tpf:.1f}ms, ", end='')
                 print(f"RTF: {rtf:.1f}")
                 streamer.reset_time_per_frame()
-
             length = streamer.total_length if first else streamer.stride
             first = False
             current_time += length / args.sample_rate
             frame, overflow = stream_in.read(length)
+
+            shift = len(frame)
+            plotdata = np.roll(plotdata, -shift, axis=0)
+            plotdata[-shift:, :] = frame
+
             frame = torch.from_numpy(frame).mean(dim=1).to(args.device)
             with torch.no_grad():
                 out = streamer.feed(frame[None])[0]
@@ -143,6 +177,15 @@ def main():
                 print("Clipping!!")
             out.clamp_(-1, 1)
             out = out.cpu().numpy()
+
+            shift = len(out)
+            plotdata_enhance = np.roll(plotdata_enhance, -shift, axis=0)
+            plotdata_enhance[-shift:, :] = np.reshape(out[:, 0], (shift, 1))
+
+            if counter % 50 == 0:
+                loop.run_until_complete(plot_trace(plotdata, plotdata_enhance))
+            counter += 1
+
             underflow = stream_out.write(out)
             if overflow or underflow:
                 if current_time >= last_error_time + cooldown_time:
