@@ -9,12 +9,15 @@ import argparse
 import sys
 
 import sounddevice as sd
+import soundfile as sf
 import torch
+
+import queue
+import threading
 
 from .demucs import DemucsStreamer
 from .pretrained import add_model_flags, get_model
 from .utils import bold
-
 
 def get_parser():
     parser = argparse.ArgumentParser(
@@ -51,6 +54,15 @@ def get_parser():
         "-f", "--num_frames", type=int, default=1,
         help="Number of frames to process at once. Larger values increase "
              "the overall lag, but will improve speed.")
+    parser.add_argument(
+        "-b", "--bg_filename",
+        help="Background Audio File")
+    parser.add_argument(
+        "--bg_blocksize", type=int, default=2048,
+        help='block size (default: %(default)s)')
+    parser.add_argument(
+        "--bg_buffersize", type=int, default=20,
+        help='number of blocks used for buffering (default: %(default)s)')
     return parser
 
 
@@ -78,28 +90,78 @@ def query_devices(device, kind):
         sys.exit(1)
     return caps
 
+def bg_audio(device_out):
+    global bg_q
+    bg_q = queue.Queue(maxsize=args.bg_buffersize)
+    bg_event = threading.Event()
+
+    if args.bg_filename:
+        with sf.SoundFile(args.bg_filename) as f:
+            for _ in range(args.bg_buffersize):
+                data = f.buffer_read(args.bg_blocksize, dtype='float32')
+                if not data:
+                    break
+                bg_q.put_nowait(data)  # Pre-fill queue
+            
+            bg_stream = sd.RawOutputStream(
+                samplerate=f.samplerate, blocksize=args.bg_blocksize,
+                device=device_out, channels=f.channels, dtype='float32',
+                callback=bg_callback, finished_callback=bg_event.set)
+
+            with bg_stream:
+                timeout = args.bg_blocksize * args.bg_buffersize / f.samplerate
+                while data:
+                    data = f.buffer_read(args.bg_blocksize, dtype='float32')
+                    bg_q.put(data, timeout=timeout)
+                bg_event.wait()  # Wait until playback is finished
+
+def bg_callback(outdata, frames, time, status):
+    # assert frames == args.bg_blocksize
+    if status.output_underflow:
+        print('Output underflow: increase blocksize?', file=sys.stderr)
+        raise sd.CallbackAbort
+    assert not status
+    try:
+        data = bg_q.get_nowait()
+    except queue.Empty as e:
+        print('Buffer is empty: increase buffersize?', file=sys.stderr)
+        raise sd.CallbackAbort from e
+    if len(data) < len(outdata):
+        outdata[:len(data)] = data
+        outdata[len(data):] = b'\x00' * (len(outdata) - len(data))
+        raise sd.CallbackStop
+    else:
+        outdata[:] = data 
 
 def main():
+    global args
     args = get_parser().parse_args()
+
     if args.num_threads:
         torch.set_num_threads(args.num_threads)
+
+    device_out = parse_audio_device(args.out)
+    caps = query_devices(device_out, "output")
+    channels_out = min(caps['max_output_channels'], 2)
 
     model = get_model(args).to(args.device)
     model.eval()
     print("Model loaded.")
     streamer = DemucsStreamer(model, dry=args.dry, num_frames=args.num_frames)
 
+    bg_audio_thread = threading.Thread(target=bg_audio, args=(device_out,), daemon=True)
+    bg_audio_thread.start()
+
     device_in = parse_audio_device(args.in_)
     caps = query_devices(device_in, "input")
     channels_in = min(caps['max_input_channels'], 2)
+    
     stream_in = sd.InputStream(
         device=device_in,
         samplerate=args.sample_rate,
         channels=channels_in)
 
-    device_out = parse_audio_device(args.out)
-    caps = query_devices(device_out, "output")
-    channels_out = min(caps['max_output_channels'], 2)
+    
     stream_out = sd.OutputStream(
         device=device_out,
         samplerate=args.sample_rate,
@@ -107,6 +169,7 @@ def main():
 
     stream_in.start()
     stream_out.start()
+
     first = True
     current_time = 0
     last_log_time = 0
@@ -153,6 +216,7 @@ def main():
         except KeyboardInterrupt:
             print("Stopping")
             break
+    
     stream_out.stop()
     stream_in.stop()
 
