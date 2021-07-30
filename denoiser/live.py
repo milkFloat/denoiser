@@ -7,7 +7,7 @@
 
 import argparse
 import sys
-import queue
+import os
 
 import sounddevice as sd
 import torch
@@ -17,6 +17,7 @@ from .pretrained import add_model_flags, get_model
 from .utils import bold
 import numpy as np
 from denoiser.live_plotting import *
+import soundfile as sf
 
 
 def get_parser():
@@ -82,30 +83,8 @@ def query_devices(device, kind):
     return caps
 
 
-# input_audio = queue.Queue()
-# output_audio = queue.Queue()
-# plotdata = np.zeros((20000, 1))
-# plotdata_enhance = np.zeros((20000, 1))
-#
-# fig, (ax1, ax2) = plt.subplots(nrows=2)
-# ax1.set_ylim([-0.5, 0.5])
-# ax2.set_ylim([-0.5, 0.5])
-# lines1 = ax1.plot(plotdata)
-# lines2 = ax2.plot(plotdata_enhance)
-#
-#
-# lines = [lines1, lines2]
-#
-#
-# async def plot_trace(data, data_enhance):
-#     for column, line in enumerate(lines[0]):
-#         line.set_ydata(data[:])
-#     for column, line in enumerate(lines[1]):
-#         line.set_ydata(data_enhance[:])
-#     plt.savefig('/Users/ashanahan/Documents/GitHub/denoiser/templates/03.png')
-#
-# loop = asyncio.get_event_loop()
-
+if os.path.exists('soundfile.wav'):
+    os.remove('soundfile.wav')
 
 def main():
     global plotdata, plotdata_enhance
@@ -146,58 +125,63 @@ def main():
     stride_ms = streamer.stride / sr_ms
     print(f"Ready to process audio, total lag: {streamer.total_length / sr_ms:.1f}ms.")
     counter = 1
-    while True:
-        try:
-            if current_time > last_log_time + log_delta:
-                last_log_time = current_time
-                tpf = streamer.time_per_frame * 1000
-                rtf = tpf / stride_ms
-                print(f"time per frame: {tpf:.1f}ms, ", end='')
-                print(f"RTF: {rtf:.1f}")
-                streamer.reset_time_per_frame()
-            length = streamer.total_length if first else streamer.stride
-            first = False
-            current_time += length / args.sample_rate
-            frame, overflow = stream_in.read(length)
+    record=False
+    with sf.SoundFile('soundfile.wav', mode='x', samplerate=16000,
+                      channels=2, subtype='PCM_24') as file:
+        while True:
+            try:
+                if current_time > last_log_time + log_delta:
+                    last_log_time = current_time
+                    tpf = streamer.time_per_frame * 1000
+                    rtf = tpf / stride_ms
+                    print(f"time per frame: {tpf:.1f}ms, ", end='')
+                    print(f"RTF: {rtf:.1f}")
+                    streamer.reset_time_per_frame()
+                length = streamer.total_length if first else streamer.stride
+                first = False
+                current_time += length / args.sample_rate
+                frame, overflow = stream_in.read(length)
 
-            shift = len(frame)
-            plotdata = np.roll(plotdata, -shift, axis=0)
-            plotdata[-shift:, :] = frame
+                shift = len(frame)
+                plotdata = np.roll(plotdata, -shift, axis=0)
+                plotdata[-shift:, :] = frame
 
-            frame = torch.from_numpy(frame).mean(dim=1).to(args.device)
-            with torch.no_grad():
-                out = streamer.feed(frame[None])[0]
-            if not out.numel():
-                continue
-            if args.compressor:
-                out = 0.99 * torch.tanh(out)
-            out = out[:, None].repeat(1, channels_out)
-            mx = out.abs().max().item()
-            if mx > 1:
-                print("Clipping!!")
-            out.clamp_(-1, 1)
-            out = out.cpu().numpy()
+                frame = torch.from_numpy(frame).mean(dim=1).to(args.device)
+                with torch.no_grad():
+                    out = streamer.feed(frame[None])[0]
+                if not out.numel():
+                    continue
+                if args.compressor:
+                    out = 0.99 * torch.tanh(out)
+                out = out[:, None].repeat(1, channels_out)
+                mx = out.abs().max().item()
+                if mx > 1:
+                    print("Clipping!!")
+                out.clamp_(-1, 1)
+                out = out.cpu().numpy()
 
-            shift = len(out)
-            plotdata_enhance = np.roll(plotdata_enhance, -shift, axis=0)
-            plotdata_enhance[-shift:, :] = np.reshape(out[:, 0], (shift, 1))
+                shift = len(out)
+                plotdata_enhance = np.roll(plotdata_enhance, -shift, axis=0)
+                plotdata_enhance[-shift:, :] = np.reshape(out[:, 0], (shift, 1))
 
-            if counter % 50 == 0:
-                loop.run_until_complete(plot_trace(plotdata, plotdata_enhance))
-            counter += 1
+                # if counter % 100 == 0:
+                #     loop.run_until_complete(plot_trace(plotdata, plotdata_enhance))
+                counter += 1
 
-            underflow = stream_out.write(out)
-            if overflow or underflow:
-                if current_time >= last_error_time + cooldown_time:
-                    last_error_time = current_time
-                    tpf = 1000 * streamer.time_per_frame
-                    print(f"Not processing audio fast enough, time per frame is {tpf:.1f}ms "
-                          f"(should be less than {stride_ms:.1f}ms).")
-        except KeyboardInterrupt:
-            print("Stopping")
-            break
-    stream_out.stop()
-    stream_in.stop()
+                underflow = stream_out.write(out)
+                if record:
+                    file.write(out)
+                if overflow or underflow:
+                    if current_time >= last_error_time + cooldown_time:
+                        last_error_time = current_time
+                        tpf = 1000 * streamer.time_per_frame
+                        print(f"Not processing audio fast enough, time per frame is {tpf:.1f}ms "
+                              f"(should be less than {stride_ms:.1f}ms).")
+            except KeyboardInterrupt:
+                print("Stopping")
+                break
+        stream_out.stop()
+        stream_in.stop()
 
 
 if __name__ == "__main__":
