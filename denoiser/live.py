@@ -83,10 +83,11 @@ def query_devices(device, kind):
     return caps
 
 
-def plot_trace(data, data_enhance, sample_rate):
+def plot_trace(data, data_enhance, sample_rate, record_time):
     params = {'raw_audio': base64.b64encode(data),
               'enhanced_audio': base64.b64encode(data_enhance),
-              'sample_rate': sample_rate}
+              'sample_rate': sample_rate,
+              'time': record_time}
     try:
         r = requests.post('http://localhost:4000/audio-quality', data=params).json()
     except requests.exceptions.ConnectionError:
@@ -175,6 +176,7 @@ def main():
                     print("Clipping!!")
                 out.clamp_(-1, 1)
                 out = out.cpu().numpy()
+
                 # Debugging model inference time end
                 t2_model = time.time()
 
@@ -185,8 +187,13 @@ def main():
                 # 250 iterations equates to 4s at sample rate of 16kHz
                 # Execute post request in separate thread as we don't
                 # need to wait for the response to continue
-                if counter % 250 == 0:
-                    t = threading.Thread(target=plot_trace, args=(raw_data, enhanced_data, args.sample_rate))
+                if counter < 250:
+                    pass
+                elif counter == 250:
+                    t = threading.Thread(target=plot_trace, args=(raw_data, enhanced_data, args.sample_rate, t1))
+                    t.start()
+                elif counter % 50 == 0:
+                    t = threading.Thread(target=plot_trace, args=(raw_data, enhanced_data, args.sample_rate, t1))
                     t.start()
                 counter += 1
 
