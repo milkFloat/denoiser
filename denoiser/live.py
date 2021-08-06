@@ -1,23 +1,23 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-# author: adefossez
-
 import argparse
 import sys
 import os
+import time
+import threading
+import base64
 
+import soundfile as sf
 import sounddevice as sd
 import torch
+import requests
+import numpy as np
 
 from .demucs import DemucsStreamer
 from .pretrained import add_model_flags, get_model
 from .utils import bold
-import numpy as np
-from denoiser.live_plotting import *
-import soundfile as sf
+
+# If previous recording exists delete it
+if os.path.exists('soundfile.wav'):
+    os.remove('soundfile.wav')
 
 
 def get_parser():
@@ -83,11 +83,22 @@ def query_devices(device, kind):
     return caps
 
 
-if os.path.exists('soundfile.wav'):
-    os.remove('soundfile.wav')
+def plot_trace(data, data_enhance, sample_rate):
+    params = {'raw_audio': base64.b64encode(data),
+              'enhanced_audio': base64.b64encode(data_enhance),
+              'sample_rate': sample_rate}
+    try:
+        r = requests.post('http://localhost:4000/audio-quality', data=params).json()
+    except requests.exceptions.ConnectionError:
+        print('Post failure')
+        pass
+
 
 def main():
-    global plotdata, plotdata_enhance
+    # Initialise empty arrays to store rolling audio data
+    raw_data = np.zeros((64000, 1))
+    enhanced_data = np.zeros((64000, 1))
+
     args = get_parser().parse_args()
     if args.num_threads:
         torch.set_num_threads(args.num_threads)
@@ -103,7 +114,7 @@ def main():
     stream_in = sd.InputStream(
         device=device_in,
         samplerate=args.sample_rate,
-        channels=channels_in)
+        channels=1)  # channels_in)
 
     device_out = parse_audio_device(args.out)
     caps = query_devices(device_out, "output")
@@ -111,7 +122,7 @@ def main():
     stream_out = sd.OutputStream(
         device=device_out,
         samplerate=args.sample_rate,
-        channels=2)#channels_out)
+        channels=2)  # channels_out)
 
     stream_in.start()
     stream_out.start()
@@ -125,11 +136,13 @@ def main():
     stride_ms = streamer.stride / sr_ms
     print(f"Ready to process audio, total lag: {streamer.total_length / sr_ms:.1f}ms.")
     counter = 1
-    record=False
+    # Record transformed audio to wav file
+    # record = False
     with sf.SoundFile('soundfile.wav', mode='x', samplerate=16000,
                       channels=2, subtype='PCM_24') as file:
         while True:
             try:
+                t1 = time.time()
                 if current_time > last_log_time + log_delta:
                     last_log_time = current_time
                     tpf = streamer.time_per_frame * 1000
@@ -137,15 +150,18 @@ def main():
                     print(f"time per frame: {tpf:.1f}ms, ", end='')
                     print(f"RTF: {rtf:.1f}")
                     streamer.reset_time_per_frame()
+
                 length = streamer.total_length if first else streamer.stride
                 first = False
                 current_time += length / args.sample_rate
                 frame, overflow = stream_in.read(length)
 
                 shift = len(frame)
-                plotdata = np.roll(plotdata, -shift, axis=0)
-                plotdata[-shift:, :] = frame
+                raw_data = np.roll(raw_data, -shift, axis=0)
+                raw_data[-shift:, :] = frame
 
+                # Debugging model inference time start
+                t1_model = time.time()
                 frame = torch.from_numpy(frame).mean(dim=1).to(args.device)
                 with torch.no_grad():
                     out = streamer.feed(frame[None])[0]
@@ -159,24 +175,31 @@ def main():
                     print("Clipping!!")
                 out.clamp_(-1, 1)
                 out = out.cpu().numpy()
+                # Debugging model inference time end
+                t2_model = time.time()
 
                 shift = len(out)
-                plotdata_enhance = np.roll(plotdata_enhance, -shift, axis=0)
-                plotdata_enhance[-shift:, :] = np.reshape(out[:, 0], (shift, 1))
+                enhanced_data = np.roll(enhanced_data, -shift, axis=0)
+                enhanced_data[-shift:, :] = np.reshape(out[:, 0], (shift, 1))
 
-                # if counter % 100 == 0:
-                #     loop.run_until_complete(plot_trace(plotdata, plotdata_enhance))
+                # 250 iterations equates to 4s at sample rate of 16kHz
+                # Execute post request in separate thread as we don't
+                # need to wait for the response to continue
+                if counter % 250 == 0:
+                    t = threading.Thread(target=plot_trace, args=(raw_data, enhanced_data, args.sample_rate))
+                    t.start()
                 counter += 1
 
                 underflow = stream_out.write(out)
-                if record:
-                    file.write(out)
+                # if record:
+                #     file.write(out)
                 if overflow or underflow:
                     if current_time >= last_error_time + cooldown_time:
                         last_error_time = current_time
                         tpf = 1000 * streamer.time_per_frame
-                        print(f"Not processing audio fast enough, time per frame is {tpf:.1f}ms "
+                        print(f"Not processing audio fast enough, time per frame is {((time.time()-t1)*1000):.1f}ms "
                               f"(should be less than {stride_ms:.1f}ms).")
+                        print(f'Model inference time: {((t2_model - t1_model) * 1000):.1f}ms')
             except KeyboardInterrupt:
                 print("Stopping")
                 break
