@@ -14,6 +14,8 @@ import numpy as np
 from .demucs import DemucsStreamer
 from .pretrained import add_model_flags, get_model
 from .utils import bold
+import redis
+import pickle
 
 # If previous recording exists delete it
 if os.path.exists('soundfile.wav'):
@@ -83,18 +85,15 @@ def query_devices(device, kind):
     return caps
 
 
+r = redis.Redis(host='localhost', port=6378, db=0)
+
+
 def plot_trace(data, data_enhance, sample_rate, record_time):
     params = {'raw_audio': base64.b64encode(data),
               'enhanced_audio': base64.b64encode(data_enhance),
               'sample_rate': sample_rate,
               'time': record_time}
-    try:
-        t1= time.time()
-        r = requests.post('http://audio-LoadB-VHQ7BZMR5ZML-5b200355a127b0f9.elb.eu-west-1.amazonaws.com:4000/audio-quality', data=params).json()
-        print(f'Post request time: {time.time()-t1}')
-    except requests.exceptions.ConnectionError:
-        print('Post failure')
-        pass
+    r.rpush('blue_yeti', pickle.dumps(params))
 
 
 def main():
@@ -186,15 +185,15 @@ def main():
                 enhanced_data = np.roll(enhanced_data, -shift, axis=0)
                 enhanced_data[-shift:, :] = np.reshape(out[:, 0], (shift, 1))
 
-                # 250 iterations equates to 4s at sample rate of 16kHz
-                # Execute post request in separate thread as we don't
-                # need to wait for the response to continue
-                if counter < 250:
+                # Time per frame needs to be <16ms.
+                # Assuming a duration of 16ms per frame we want to output at a slower rate than
+                # the post request. Post request is approx. 1.5s so output every 130 frames
+                if counter < 130:
                     pass
-                elif counter == 250:
+                elif counter == 130:
                     t = threading.Thread(target=plot_trace, args=(raw_data, enhanced_data, args.sample_rate, t1))
                     t.start()
-                elif counter % 50 == 0:
+                elif counter % 130 == 0:
                     t = threading.Thread(target=plot_trace, args=(raw_data, enhanced_data, args.sample_rate, t1))
                     t.start()
                 counter += 1
